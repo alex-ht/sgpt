@@ -29,11 +29,13 @@ from datetime import datetime
 import numpy as np
 import torch.cuda
 import tqdm
+import transformers
 from sentence_transformers import SentenceTransformer, LoggingHandler, util, models, losses, InputExample, evaluation
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from accelerate import Accelerator
 from accelerate import DistributedDataParallelKwargs
+from accelerate.utils import DummyOptim
 
 #### Just some code to print debug information to stdout
 logging.basicConfig(format='%(asctime)s - %(message)s',
@@ -95,7 +97,7 @@ num_negs_per_system = args.num_negs_per_system  # We used different systems to m
 num_epochs = args.epochs  # Number of epochs we want to train
 
 
-if "gpt" in model_name:
+if "bloom" in model_name:
     accelerator = Accelerator()
 else:
     # Needed to run e.g. bert-large-uncased (Can also be used with GPT but will use unnecessary memory)
@@ -104,7 +106,7 @@ else:
 
 if args.wandb and accelerator.is_main_process:
     import wandb
-    wandb.init(project="sgpt", entity="muennighoff")
+    wandb.init(project="sgpt-7b1-msmacro", entity="alex-ht")
     wandb.config.update(args)
 
 # Load our embedding model
@@ -129,7 +131,7 @@ elif args.asym:
         w2.tokenizer.add_tokens(tokens, special_tokens=True)
         w1.auto_model.resize_token_embeddings(len(w1.tokenizer))
         w2.auto_model.resize_token_embeddings(len(w2.tokenizer))
-    if "gpt" in model_name:
+    if "bloom" in model_name:
         w1.tokenizer.pad_token = w1.tokenizer.eos_token
         w2.tokenizer.pad_token = w2.tokenizer.eos_token
     assert w1.get_word_embedding_dimension() == w2.get_word_embedding_dimension()
@@ -141,7 +143,7 @@ elif args.asym:
 else:
     logging.info("Create new SBERT model")
     word_embedding_model = models.Transformer(model_name, max_seq_length=max_seq_length)
-    if "gpt" in model_name:
+    if "bloom" in model_name:
         word_embedding_model.tokenizer.pad_token = word_embedding_model.tokenizer.eos_token
     
     if args.add_special_token or args.speca:
@@ -246,7 +248,8 @@ if not args.no_training:
             util.http_get(
                 'https://huggingface.co/datasets/sentence-transformers/msmarco-hard-negatives/resolve/main/msmarco-hard-negatives.jsonl.gz',
                 hard_negatives_filepath)
-
+    
+    accelerator.wait_for_everyone()
     ### Read the train queries, store in queries dict
     queries = {}  # dict in the format: query_id -> query. Stores all training queries
 
@@ -369,8 +372,11 @@ if not args.no_training:
     # For training the SentenceTransformer model, we need a dataset, a dataloader, and a loss used for training.
     train_dataset = MSMARCODataset(train_queries, corpus=corpus, asym=args.asym)
     train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=train_batch_size)
+    is_deepspeed = False
+    if getattr(accelerator.state, "deepspeed_plugin", None):
+        is_deepspeed = True
     if args.gradcache:
-        train_loss = losses.MNRLGradCache(model, chunk_size=args.chunksize)
+        train_loss = losses.MNRLGradCache(model, chunk_size=args.chunksize, accelerator=accelerator)
     else:
         train_loss = losses.MultipleNegativesRankingLoss(model)
 
@@ -381,6 +387,7 @@ if not args.no_training:
     # If X devices; Train-loader is X times bigger than actual steps
     checkpoint_save_steps = len(train_dataloader) // accelerator.num_processes
     logging.info(f"Dataloader length: {len(train_dataloader)}, CKPT Save Steps: {checkpoint_save_steps}")
+    optimizer_class = DummyOptim if is_deepspeed else transformers.AdamW
 
     # Train the model
     model.fit(train_objectives=[(train_dataloader, train_loss)],
@@ -396,6 +403,7 @@ if not args.no_training:
               log_wandb=args.wandb,
               use_gradcache=args.gradcache,
               chunk_size=args.chunksize,
+              optimizer_class=optimizer_class,
               )
 
     # Save the model

@@ -23,6 +23,7 @@ import queue
 import tempfile
 from distutils.dir_util import copy_tree
 from accelerate import Accelerator
+from accelerate.utils import DummyOptim, DummyScheduler
 
 from . import __MODEL_HUB_ORGANIZATION__
 from .evaluation import SentenceEvaluator
@@ -697,35 +698,23 @@ class SentenceTransformer(nn.Sequential):
             from torch.cuda.amp import autocast
             scaler = torch.cuda.amp.GradScaler()
 
-        dataloaders = [dataloader for dataloader, _ in train_objectives]
-        # Use smart batching
-        for dataloader in dataloaders:
-            dataloader.collate_fn = self.smart_batching_collate
-        dataloaders = [accelerator.prepare(dataloader) for dataloader in dataloaders]
-
-        loss_models = [loss for _, loss in train_objectives]
-        if use_gradcache:
-            # Reinitialize the class with the new model to grab the updated model in the super function in MNRLGradCache
-            loss_models = [loss_model.__class__(accelerator.prepare(loss_model.model), chunk_size=chunk_size) for loss_model in loss_models]
-        else:
-            loss_models = [accelerator.prepare(loss_model) for loss_model in loss_models]
-
         self.best_score = -9999999
 
-        if steps_per_epoch is None or steps_per_epoch == 0:
-            steps_per_epoch = min([len(dataloader) for dataloader in dataloaders])
-
-        num_train_steps = int(steps_per_epoch * epochs)
-
+        dataloaders = []
+        loss_models = []
         # Prepare optimizers
         optimizers = []
         schedulers = []
-        for loss_model in loss_models:
-            if use_gradcache:
-                param_optimizer = list(loss_model.model.named_parameters())
-            else:
-                param_optimizer = list(loss_model.named_parameters())
 
+        if steps_per_epoch is None or steps_per_epoch == 0:
+            steps_per_epoch = min([len(dataloader) for dataloader, _ in train_objectives])
+        num_train_steps = int(len(dataloader) * epochs)
+
+        for dataloader, loss_model in train_objectives:
+            param_optimizer = list(loss_model.named_parameters())
+            # Use smart batching
+            dataloader.collate_fn = self.smart_batching_collate
+            
             no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
             optimizer_grouped_parameters = [
                 {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': weight_decay},
@@ -733,12 +722,19 @@ class SentenceTransformer(nn.Sequential):
             ]
 
             optimizer = optimizer_class(optimizer_grouped_parameters, **optimizer_params)
-            scheduler_obj = self._get_scheduler(optimizer, scheduler=scheduler, warmup_steps=warmup_steps, t_total=num_train_steps)
+            assert optimizer_class is DummyOptim
+            if type(optimizer) is DummyOptim:
+                scheduler_obj = DummyScheduler(optimizer, total_num_steps=num_train_steps, warmup_num_steps=warmup_steps)
+            else:
+                scheduler_obj = self._get_scheduler(optimizer, scheduler=scheduler, warmup_steps=warmup_steps, t_total=num_train_steps)
 
+            dataloader, loss_model, optimizer, scheduler_obj = accelerator.prepare(dataloader, loss, optimizer, scheduler_obj)
+            if use_gradcache:
+                loss_model = loss_model.__class__(loss_model, chunk_size=chunk_size)
+            dataloaders.append(dataloader)
+            loss_models.append(loss)
             optimizers.append(optimizer)
             schedulers.append(scheduler_obj)
-
-        optimizers = [accelerator.prepare(optimizer) for optimizer in optimizers]
 
         global_step = 0
         data_iterators = [iter(dataloader) for dataloader in dataloaders]

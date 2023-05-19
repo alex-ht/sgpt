@@ -4,6 +4,11 @@ from typing import Iterable, Dict
 from ..SentenceTransformer import SentenceTransformer
 from .. import util
 from ..util import mismatched_sizes_all_gather
+from typing import List, Union
+from torch import nn, Tensor
+from torch.cuda.amp import GradScaler, autocast
+from contextlib import nullcontext
+from grad_cache.context_managers import RandContext
 
 
 class MultipleNegativesRankingLoss(nn.Module):
@@ -51,6 +56,9 @@ class MultipleNegativesRankingLoss(nn.Module):
         self.cross_entropy_loss = nn.CrossEntropyLoss()
 
     def forward(self, sentence_features: Iterable[Dict[str, Tensor]], labels: Tensor):
+        if 'token_type_ids' in sentence_features[0].keys():
+            for i in range(len(sentence_features)):
+                del sentence_features[i]['token_type_ids']
         reps = [self.model(sentence_feature)['sentence_embedding'] for sentence_feature in sentence_features]
         embeddings_a = reps[0]
 
@@ -91,7 +99,7 @@ class MNRLGradCache(GradCache):
     should overwrite build_cache & forward_backward funcs to place in accelerator.backward(loss)
     """
 
-    def __init__(self, model: SentenceTransformer, scale: float = 20.0, similarity_fct = util.cos_sim, chunk_size = 1):
+    def __init__(self, model: SentenceTransformer, scale: float = 20.0, similarity_fct = util.cos_sim, chunk_size = 1, fp16=False, accelerator=None):
         """
         chunk_size: Final batch size bottlenecking memory, i.e. set the batch size to the actual batch size you want,
             then set chunk_size to be so small that it works
@@ -100,6 +108,8 @@ class MNRLGradCache(GradCache):
         self.scale = scale
         self.similarity_fct = similarity_fct
         self.cross_entropy_loss = nn.CrossEntropyLoss()
+        self.is_deepspeed = True
+        self.accelerator = accelerator
 
         # Three times the same model for three model inputs:
         # entail_a (pos), entail_b (pos), contradict (hard negative)
@@ -110,8 +120,8 @@ class MNRLGradCache(GradCache):
             loss_fn=self.loss_fn,
             split_input_fn=None,  # Should be able to handle dict of tensors
             get_rep_fn=lambda v: v["sentence_embedding"],  
-            fp16=False,
-            scaler=None,
+            fp16=fp16,
+            scaler=GradScaler(init_scale=2**12, growth_interval=500) if fp16 else None,
         )
 
     def loss_fn(self, embeddings_a, embeddings_b, embeddings_n=None):
@@ -150,6 +160,10 @@ class MNRLGradCache(GradCache):
         # emb_a & emb_b have an entailment relation; emb_n is a contradiction
         # Note that each of those is a batch consisting of multiple emb_a's
         no_sync_except_last = True if torch.distributed.is_initialized() else False
+        if self.is_deepspeed:
+            no_sync_except_last = False
+        assert self.is_deepspeed == True
+        assert no_sync_except_last == False
         return super().__call__(*sentence_features, no_sync_except_last=no_sync_except_last)
 
     def model_call(self, model: nn.Module, model_input):
@@ -157,5 +171,67 @@ class MNRLGradCache(GradCache):
         Overwrite GradCache model_call method, as we require non-extracted dict as model input
         """
         assert isinstance(model_input, (dict, UserDict)), f"Got type {type(model_input)}, but expected Dict."
+        if 'token_type_ids' in model_input.keys():
+            del model_input['token_type_ids']
         return model(model_input)
 
+    def build_cache(self, *reps: Tensor, **loss_kwargs) -> Union[List[Tensor], Tensor]:
+        """
+        Compute the gradient cache
+        :param reps: Computed representations from all encoder models
+        :param loss_kwargs: Extra keyword arguments to the loss function
+        :return: A tuple of a) gradient cache for each encoder model, and b) loss tensor
+        """
+        reps = [r.detach().requires_grad_() for r in reps]
+        with autocast() if self.fp16 else nullcontext():
+            loss = self.compute_loss(*reps, **loss_kwargs)
+
+        if self.fp16:
+            if self.accelerator:
+                loss = self.scaler.scale(loss)
+                self.accelerator.backward(loss)
+            else:
+                self.scaler.scale(loss).backward()
+        else:
+            if self.accelerator:
+                self.accelerator.backward(loss)
+            else:
+                loss.backward()
+
+        cache = [r.grad for r in reps]
+
+        return cache, loss.detach()
+
+    def forward_backward(
+            self,
+            model: nn.Module,
+            model_inputs,
+            cached_gradients: List[Tensor],
+            random_states: List[RandContext],
+            no_sync_except_last: bool = False
+    ):
+        """
+        Run the second forward and the backward pass to compute gradient for a model.
+        :param model: Encoder model.
+        :param model_inputs: Chunked input to the encoder model.
+        :param cached_gradients: Chunked gradient cache tensor for each input.
+        :param random_states: Each input's device random state during the first forward.
+        :param no_sync_except_last: If True, under distributed setup, only trigger gradient reduction across processes
+        for the last sub-batch's forward-backward pass.
+        """
+        if no_sync_except_last:
+            sync_contexts = [model.no_sync for _ in range(len(model_inputs) - 1)] + [nullcontext]
+        else:
+            sync_contexts = [nullcontext for _ in range(len(model_inputs))]
+
+        for x, state, gradient, sync_context in zip(model_inputs, random_states, cached_gradients, sync_contexts):
+            with sync_context():
+                with state:
+                    y = self.model_call(model, x)
+                reps = self.get_reps(y)
+
+                surrogate = torch.dot(reps.flatten(), gradient.flatten())
+                if self.accelerator:
+                    self.accelerator.backward(surrogate)
+                else:
+                    surrogate.backward()

@@ -262,6 +262,8 @@ class GradCache:
             assert all(map(lambda m: isinstance(m, nn.parallel.DistributedDataParallel), self.models)), \
                 'Some of models are not wrapped in DistributedDataParallel. Make sure you are running DDP with ' \
                 'proper initializations.'
+            #if not all(map(lambda m: isinstance(m, nn.parallel.DistributedDataParallel), self.models)):
+            #    print('Some of models are not wrapped in DistributedDataParallel. Make sure you are running DDP with proper initializations.')
 
         model_inputs = [self.split_inputs(x, chunk_size) for x, chunk_size in zip(model_inputs, self.chunk_sizes)]
 
